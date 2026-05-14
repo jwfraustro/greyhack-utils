@@ -39,11 +39,11 @@ TipoRed = [
     "NetServices",
     "HardwareManufacturer",
     "Neurobox",
-    "Tutorial",
     "CurrencyCreation",
 ]
 
 seed = 0
+
 
 def ip_to_int(ip):
     """Return the integer representation of an IP address"""
@@ -76,6 +76,7 @@ def get_network_type_for_ip(ip, seed=0):
     num = ((ip_int ^ seed) & 0x7FFFFFFF) % len(TipoRed)
     return TipoRed[num]
 
+
 def is_reserved(ip):
     """
     Check if the given IP address is within a reserved IP range.
@@ -93,6 +94,7 @@ def is_reserved(ip):
         if ip1 <= ip_int <= ip2:
             return True
     return False
+
 
 def get_ip_for_type(net_type: int, seed=0, num_ips=1):
     """
@@ -121,4 +123,5 @@ def get_ip_for_type(net_type: int, seed=0, num_ips=1):
             break
     return ips
 
-print(get_network_type_for_ip("85.90.248.28", 310570129))
+
+print(get_network_type_for_ip("99.101.209.161", 2147481857))
