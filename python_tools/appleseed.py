@@ -123,7 +123,7 @@ class DotNetRandom:
             if num >= 55:
                 num -= 55
             self._seed_array[num] = num4
-            num4 = num3 - num4
+            num4 = to_int32(num3 - num4)
             if num4 < 0:
                 num4 += MBIG
             num3 = self._seed_array[num]
@@ -133,7 +133,9 @@ class DotNetRandom:
                 num5 = k + 30
                 if num5 >= 55:
                     num5 -= 55
-                self._seed_array[k] -= self._seed_array[1 + num5]
+                self._seed_array[k] = to_int32(
+                    self._seed_array[k] - self._seed_array[1 + num5]
+                )
                 if self._seed_array[k] < 0:
                     self._seed_array[k] += MBIG
 
