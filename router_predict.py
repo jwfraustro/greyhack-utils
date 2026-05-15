@@ -98,6 +98,10 @@ class RouterPrediction:
 
     lan_subnet_base: str       # the "192.168.x.1" value the router will use
 
+    # Optional: full essid string. Only derivable when wordlists are available
+    # (the corp_names Markov chain plus, for num < 3, OS.GetRandomName's draws).
+    essid: Optional[str] = field(default=None)
+
     # Optional: router password, derived if WordGenerator wordlists are available.
     # When wordlists aren't supplied, this stays None and the handoff snapshot
     # is taken right after the LAN-subnet draw. When they ARE supplied, the
@@ -135,6 +139,24 @@ def _generate_essid_structure(rng: DotNetRandom):
     return source, has_suffix, n
 
 
+def _generate_os_random_name(rng: DotNetRandom, num_chars: int = 0) -> str:
+    """Port of OS.GetRandomName with the in-game `random` non-null path.
+
+    NOTE: when called from GeneraWifiName, the game always passes a non-null
+    Random, so we don't model the Guid-seeded fallback. If num_chars == 0,
+    Next(3, 6) is drawn first (C# upper bound is exclusive → 3..5 inclusive).
+    Then num_chars draws of Next(36) index into the alphanumeric charset.
+    Result is lowercase here; the caller (GeneraWifiName) does .ToUpper().
+    """
+    charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+    if num_chars == 0:
+        num_chars = rng.next(min_value=3, max_value=6)
+    out = []
+    for _ in range(num_chars):
+        out.append(charset[rng.next(max_value=len(charset))])
+    return "".join(out)
+
+
 def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
     """Predict every derivable field for a router at (world_seed, ip_address)."""
 
@@ -165,8 +187,25 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
     # bssid = GeneraMacAddress(rng_a)  // 6 draws
     bssid = _generate_bssid(rng_a)
 
-    # essid = GeneraWifiName(rng_a)  // 1 draw + WordGenerator (opaque)
+    # essid = GeneraWifiName(rng_a)
+    #   - Next(7) selects source list and suffix flag
+    #   - WordGenerator.GetNextWord(corp_names, rng_a)  (usernames branch is dead)
+    #   - if num < 3: "_" + OS.GetRandomName(rng_a, 0).ToUpper()
+    # We must always advance the RNG by the same number of draws the game does,
+    # but the Markov chain only runs when wordlists are configured. If they
+    # aren't, we capture the structural fields, stop advancing, and bail on the
+    # essid string. (That also means downstream RNG state will diverge — but
+    # since helperLibVersions.ConfigLibVersions runs next and is unported, the
+    # post-essid handoff state isn't trustworthy without wordlists anyway.)
     essid_source, essid_has_suffix, essid_first = _generate_essid_structure(rng_a)
+    essid: Optional[str] = None
+    if _WORDGEN_AVAILABLE and wordgen._default_generator is not None:
+        base = wordgen.get_next_word(wordgen.Word.corp_names, rng_a)
+        if essid_has_suffix:
+            suffix = _generate_os_random_name(rng_a, num_chars=0).upper()
+            essid = f"{base}_{suffix}"
+        else:
+            essid = base
 
     # After this point, RouterNode does:
     #   - date = wall clock (skip)
@@ -208,9 +247,19 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
     notes = [
         "BSSID is verified against in-game observations.",
         "Domain is verified against in-game observations.",
-        "ESSID source list and suffix flag are derivable, but the actual "
-        "wifi name string requires the Markov chain WordGenerator to be ported.",
     ]
+    if essid is None:
+        notes.append(
+            "ESSID source list and suffix flag are derivable, but the full "
+            "wifi name string requires --wordlist-dir to feed the Markov chain "
+            "and (for num < 3) OS.GetRandomName."
+        )
+    else:
+        notes.append(
+            "ESSID predicted via WordGenerator (corp_names) "
+            + ("+ OS.GetRandomName suffix" if essid_has_suffix else "(no suffix)")
+            + ". UNVERIFIED — confirm against in-game observation before trusting."
+        )
     if router_password is None:
         notes.append(
             "Router password not predicted — pass --wordlist-dir to enable. "
@@ -244,6 +293,7 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
         essid_source=essid_source,
         essid_has_suffix=essid_has_suffix,
         essid_first_draw=essid_first,
+        essid=essid,
         router_id=router_id,
         lan_subnet_base=lan_subnet_base,
         router_password=router_password,
@@ -259,12 +309,19 @@ def _format_pretty(pred: RouterPrediction) -> str:
         f"  tipo_red:       {pred.tipo_red} (index {pred.tipo_red_index})",
         f"  web_address:    {pred.web_address}",
         f"  bssid:          {pred.bssid}",
-        f"  essid:          [{pred.essid_source}]"
-                            + (" + _<SUFFIX>" if pred.essid_has_suffix else "")
-                            + f"   (Next(7)={pred.essid_first_draw})",
+    ]
+    if pred.essid is not None:
+        lines.append(f"  essid:          {pred.essid!r}  (UNVERIFIED)")
+    else:
+        lines.append(
+            f"  essid:          [{pred.essid_source}]"
+            + (" + _<SUFFIX>" if pred.essid_has_suffix else "")
+            + f"   (Next(7)={pred.essid_first_draw})"
+        )
+    lines.extend([
         f"  router_id:      {pred.router_id}",
         f"  lan_subnet:     {pred.lan_subnet_base}",
-    ]
+    ])
     if pred.router_password is not None:
         lines.append(f"  router_password: {pred.router_password!r}  (UNVERIFIED)")
     lines.extend([
