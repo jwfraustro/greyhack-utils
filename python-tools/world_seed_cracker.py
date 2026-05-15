@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -222,6 +223,56 @@ class SearchConfig:
     max_results: int
 
 
+class ProgressTracker:
+    def __init__(self, chunks: Sequence[Tuple[int, int]], total_seeds: int):
+        self._chunks = list(chunks)
+        self._total_chunks = len(chunks)
+        self._total_seeds = max(1, total_seeds)
+        self._start_time = time.time()
+        self._completed_chunks = 0
+        self._completed_seeds = 0
+        self._last_started: Optional[Tuple[int, int, int]] = None
+
+    def chunk_started(self, chunk_index: int) -> None:
+        start_seed, end_seed = self._chunks[chunk_index]
+        self._last_started = (chunk_index, start_seed, end_seed)
+        print(
+            f"[chunk {chunk_index + 1}/{self._total_chunks}] checking seeds [{start_seed}, {end_seed}]",
+            flush=True,
+        )
+
+    def chunk_completed(self, chunk_index: int, found_in_chunk: int) -> None:
+        start_seed, end_seed = self._chunks[chunk_index]
+        seeds_in_chunk = (end_seed - start_seed) + 1
+        self._completed_chunks += 1
+        self._completed_seeds += seeds_in_chunk
+
+        elapsed = max(1e-9, time.time() - self._start_time)
+        fraction = min(1.0, self._completed_seeds / self._total_seeds)
+        rate = self._completed_seeds / elapsed
+        eta = (self._total_seeds - self._completed_seeds) / rate if rate > 0 else float("inf")
+        bar_width = 28
+        fill = int(fraction * bar_width)
+        bar = "#" * fill + "-" * (bar_width - fill)
+        eta_text = "inf" if eta == float("inf") else f"{eta:.1f}s"
+
+        print(
+            f"[done {self._completed_chunks}/{self._total_chunks}] [{bar}] "
+            f"{fraction * 100:6.2f}% elapsed={elapsed:8.1f}s eta={eta_text:>8} "
+            f"rate={rate:10.0f} seeds/s chunk=[{start_seed}, {end_seed}] "
+            f"chunk_matches={found_in_chunk}",
+            flush=True,
+        )
+
+    def final_summary(self) -> None:
+        elapsed = time.time() - self._start_time
+        print(
+            f"Search finished: completed {self._completed_chunks}/{self._total_chunks} chunks "
+            f"in {elapsed:.1f}s",
+            flush=True,
+        )
+
+
 def normalize_domain(domain: str) -> str:
     d = domain.strip().lower()
     if d.startswith("http://"):
@@ -329,6 +380,55 @@ def candidate_matches(
 
     return True
 
+def candidate_matches_fast(
+    world_seed: int,
+    observations: Sequence[Observation],
+    needs_domain: bool,
+    needs_full_rng: bool,
+) -> bool:
+    seed_uint = world_seed & 0xFFFFFFFF
+
+    # Phase 1: site-type filter (cheap, no RNG)
+    for obs in observations:
+        if obs.site_type is None:
+            continue
+        pred = ((obs.ip_uint_be ^ seed_uint) & 0x7FFFFFFF) % 16
+        if pred != obs.site_type:
+            return False
+
+    if not needs_full_rng:
+        return True
+
+    # Phase 2: shuffle arrays (only if we passed site-type filter and need domains)
+    shuffled_consonants = None
+    shuffled_vowels = None
+    if needs_domain:
+        shuffled_consonants = shuffle_array(BASE_CONSONANTS, world_seed)
+        shuffled_vowels = shuffle_array(BASE_VOWELS, world_seed)
+
+    # Phase 3: per-IP RNG checks (domain + BSSID)
+    for obs in observations:
+        if obs.domain is None and obs.bssid is None:
+            continue
+
+        network_seed = to_int32(world_seed + obs.ip_seed_signed)
+        rng = DotNetRandom(network_seed)
+
+        tld_idx = rng.next(max_value=len(TLDS))
+
+        if obs.domain is not None:
+            name = ip_to_unique_name(obs.ip, shuffled_consonants, shuffled_vowels)
+            pred_domain = f"www.{name.lower()}.{TLDS[tld_idx]}"
+            if pred_domain != obs.domain:
+                return False
+
+        if obs.bssid is not None:
+            mac_bytes = [rng.next(max_value=256) for _ in range(6)]
+            pred_bssid = ":".join(f"{x:02X}" for x in mac_bytes)
+            if pred_bssid != obs.bssid:
+                return False
+
+    return True
 
 def search_chunk(
     start_seed: int,
@@ -336,10 +436,11 @@ def search_chunk(
     observations: Sequence[Observation],
     max_results: int,
     needs_domain: bool,
+    needs_full_rng: bool = True
 ) -> List[int]:
     results: List[int] = []
     for seed in range(start_seed, end_seed + 1):
-        if candidate_matches(seed, observations, needs_domain):
+        if candidate_matches_fast(seed, observations, needs_domain, needs_full_rng):
             results.append(seed)
             if len(results) >= max_results:
                 break
@@ -365,37 +466,63 @@ def crack_world_seed(
         raise ValueError("start_seed cannot be greater than end_seed")
 
     needs_domain = any(o.domain is not None for o in observations)
+    needs_full_rng = any(o.domain is not None or o.bssid is not None for o in observations)
     chunks = build_chunks(cfg.start_seed, cfg.end_seed, cfg.chunk_size)
+    total_seeds = (cfg.end_seed - cfg.start_seed) + 1
+    progress = ProgressTracker(chunks, total_seeds)
 
     if cfg.workers <= 1:
         found: List[int] = []
-        for s, e in chunks:
-            found.extend(
-                search_chunk(
-                    s, e, observations, cfg.max_results - len(found), needs_domain
-                )
+        for i, (s, e) in enumerate(chunks):
+            progress.chunk_started(i)
+            chunk_results = search_chunk(
+                s, e, observations, cfg.max_results - len(found), needs_domain, needs_full_rng
             )
+            found.extend(chunk_results)
+            progress.chunk_completed(i, len(chunk_results))
             if len(found) >= cfg.max_results:
                 break
+        progress.final_summary()
         return found
 
     found = []
-    with ProcessPoolExecutor(max_workers=cfg.workers) as executor:
-        futures = {
-            executor.submit(
-                search_chunk, s, e, observations, cfg.max_results, needs_domain
-            ): (s, e)
-            for s, e in chunks
-        }
+    executor = ProcessPoolExecutor(max_workers=cfg.workers)
+    futures = {}
 
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                found.extend(res)
-                if len(found) >= cfg.max_results:
-                    break
+    try:
+        next_chunk = 0
+        initial = min(cfg.workers, len(chunks))
+        for _ in range(initial):
+            s, e = chunks[next_chunk]
+            progress.chunk_started(next_chunk)
+            future = executor.submit(
+                search_chunk, s, e, observations, cfg.max_results, needs_domain, needs_full_rng
+            )
+            futures[future] = next_chunk
+            next_chunk += 1
+
+        while futures:
+            completed_future = next(as_completed(futures))
+            chunk_index = futures.pop(completed_future)
+            chunk_results = completed_future.result()
+            found.extend(chunk_results)
+            progress.chunk_completed(chunk_index, len(chunk_results))
+            if len(found) >= cfg.max_results:
+                break
+
+            if next_chunk < len(chunks):
+                s, e = chunks[next_chunk]
+                progress.chunk_started(next_chunk)
+                future = executor.submit(
+                    search_chunk, s, e, observations, cfg.max_results, needs_domain, needs_full_rng
+                )
+                futures[future] = next_chunk
+                next_chunk += 1
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     found = sorted(set(found))
+    progress.final_summary()
     return found[: cfg.max_results]
 
 
