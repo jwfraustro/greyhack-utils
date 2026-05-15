@@ -592,6 +592,11 @@ def search_chunk(
             results.append(seed)
             if len(results) >= max_results:
                 break
+
+    with open("chunk_results.txt", "a", encoding="utf-8") as f:
+        f.write(f"Chunk [{start_seed}, {end_seed}] found {len(results)} candidates\n")
+        f.write("\n".join(str(r) for r in results))
+        f.write("\n")
     return results
 
 
@@ -609,6 +614,10 @@ def search_survivors(
             results.append(seed)
             if len(results) >= max_results:
                 break
+    with open("survivor_results.txt", "a", encoding="utf-8") as f:
+        f.write(f"Survivor batch of {len(survivors)} seeds found {len(results)} candidates\n")
+        f.write("\n".join(str(r) for r in results))
+        f.write("\n")
     return results
 
 
@@ -796,7 +805,6 @@ def _crack_with_cpu(
 
     # Full-RNG observations guarantee uniqueness: the first hit is THE answer.
     effective_max = 1 if needs_full_rng else cfg.max_results
-
 
     if cfg.workers <= 1:
         found: List[int] = []
