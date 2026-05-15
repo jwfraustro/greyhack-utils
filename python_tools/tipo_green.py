@@ -2,7 +2,20 @@
 # Allows one-shot determination of a website's TipoRed (type) based on its IP address, or
 # generation of (semi) infinite random IP's of a given type.
 
-
+from cracker_2 import (
+    BASE_CONSONANTS,
+    BASE_VOWELS,
+    TLDS,
+    DotNetRandom,
+    Observation,
+    _precompute_domain_check,
+    ip_to_uint_be,
+    ip_to_unique_name,
+    get_seed_from_ip_like_csharp,
+    shuffle_array,
+    to_int32,
+    normalize_domain,
+)
 import random
 
 reserved_ips = {
@@ -74,7 +87,7 @@ def get_network_type_for_ip(ip, seed=0):
     """
     ip_int = ip_to_int(ip)
     num = ((ip_int ^ seed) & 0x7FFFFFFF) % len(TipoRed)
-    return TipoRed[num]
+    return num, TipoRed[num]
 
 
 def is_reserved(ip):
@@ -123,5 +136,19 @@ def get_ip_for_type(net_type: int, seed=0, num_ips=1):
             break
     return ips
 
+def cpu_predict_domain(world_seed: int, ip: str) -> tuple:
+    """Faithfully predict the domain for the given world seed + IP."""
+    shuffled_consonants = shuffle_array(BASE_CONSONANTS, world_seed)
+    shuffled_vowels = shuffle_array(BASE_VOWELS, world_seed)
+    name = ip_to_unique_name(ip, shuffled_consonants, shuffled_vowels)
 
-print(get_network_type_for_ip("99.101.209.161", 2147481857))
+    ip_seed = get_seed_from_ip_like_csharp(ip)
+    network_seed = to_int32(world_seed + ip_seed)
+    rng = DotNetRandom(network_seed)
+    tld_idx = rng.next(max_value=len(TLDS))
+    tld = TLDS[tld_idx]
+
+    return f"www.{name.lower()}.{tld}", tld_idx, shuffled_consonants, shuffled_vowels
+
+
+print(cpu_predict_domain(695246865, "1.2.3.4"))
