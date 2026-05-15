@@ -3,48 +3,10 @@
 Predict the deterministic contents of a Grey Hack RouterNode + Router from
 (worldSeed, IP) alone.
 
-KNOWN ISSUE (2026-05): for certain network seeds, _internal_sample() returns
-negative values, producing nonsense BSSID bytes (e.g. "E2:-39:74:..." for
-198.51.100.200 under seed -1285005987). Root cause appears to be that
-DotNetRandom.__init__ in world_seed_cracker.py does not bound _seed_array
-entries to [0, MBIG) at every step — C# uses int32 with overflow semantics;
-our Python port lets values exceed int32 range, which contaminates later
-draws. The cracker happens to work despite this because domain prediction
-only consumes one Next(4) draw (early, before contamination accumulates).
-Fix this in DotNetRandom and the predictor will work for all seeds.
-
-This mirrors the C# generation sequence in ServerMap.RouterNode and Router
-constructors. It predicts everything that is purely a function of the seeded
-PRNG state, stopping at the first call that depends on game data we don't have
-faithfully ported (Markov chain wordlist, hardware tables, filesystem template).
-
-For each IP, the predictor produces:
-
-  RouterNode constructor chain (Random A, seeded with worldSeed + ipSeed):
-    seed         — network seed (worldSeed + IP.GetSeedFromIP(ip))
-    tipoRed      — site type (no RNG, pure XOR math)
-    webAddress   — full domain (1 RNG draw for TLD)
-    bssid        — MAC address (6 RNG draws of Next(256))
-    essid_skel   — structural fingerprint of the wifi name (1 draw of Next(7))
-                   tells us source list (usernames vs corp_names) and whether
-                   the _SUFFIX is appended (num < 3)
-
-  GeneraRouter routerID chain (Random B, fresh, same seed):
-    routerID     — "{ip}:{Next(int.MaxValue)}"
-
-  Router constructor chain (Random C, fresh, same seed):
-    lan_subnet   — "192.168.{Next(2)}.1"  (except RentServer which is fixed)
-    rng_state_at_handoff — state of Random C immediately after lan_subnet draw,
-                           which is where WordGenerator.GetNextWord(passwords)
-                           would consume RNG to produce routerPassword
-
-The handoff RNG state is included so this tool can be extended once the
-Markov generator, hardware tables, and filesystem template are ported.
-
 Usage:
   router_predict.py --seed -1285005987 --ip 99.71.91.182
-  router_predict.py --seed -1285005987 --ips ips.txt
-  router_predict.py --seed -1285005987 --ip 99.71.91.182 --format pretty
+  router_predict.py --seed -1285005987 --ip 99.71.91.182 \\
+                    --wordlist-dir /path/to/wordlists
 """
 
 from __future__ import annotations
@@ -69,6 +31,15 @@ from python_tools.appleseed import (
     to_int32,
     to_uint32,
 )
+
+# WordGenerator is optional. If the user supplies --wordlist-dir, we'll
+# configure it and use it to predict the router password.
+# try:
+from python_tools import wordgen
+_WORDGEN_AVAILABLE = True
+# except ImportError:
+#     wordgen = None
+#     _WORDGEN_AVAILABLE = False
 
 
 # Match ServerMap.TipoRed enum ordering. Note the enum starts with Unknown=0,
@@ -125,11 +96,16 @@ class RouterPrediction:
     # GeneraRouter (Random B, fresh)
     router_id: str
 
-    # Router constructor up to the wordgen handoff (Random C, fresh)
     lan_subnet_base: str       # the "192.168.x.1" value the router will use
 
-    # State of Random C immediately after the LAN-subnet draw, suitable for
-    # resuming generation once a WordGenerator port is available.
+    # Optional: router password, derived if WordGenerator wordlists are available.
+    # When wordlists aren't supplied, this stays None and the handoff snapshot
+    # is taken right after the LAN-subnet draw. When they ARE supplied, the
+    # password is generated and the handoff snapshot is taken AFTER it.
+    router_password: Optional[str] = field(default=None)
+
+    # State of Random C at the last predictable point, suitable for resuming
+    # generation once more decomps are ported.
     handoff_rng_state: Optional[RngStateSnapshot] = field(default=None)
 
     # Caveats — fields that depend on game data we have not ported.
@@ -216,9 +192,17 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
     lan_subnet_octet = rng_c.next(max_value=2)
     lan_subnet_base = f"192.168.{lan_subnet_octet}.1"
 
+    # Optional: router password via WordGenerator (Markov chain).
+    # Only available if the caller has configured wordgen with the wordlist
+    # directory; otherwise we stop here and let the handoff snapshot carry
+    # the RNG state forward.
+    router_password: Optional[str] = None
+    if _WORDGEN_AVAILABLE and wordgen._default_generator is not None:
+        router_password = wordgen.get_next_word(wordgen.Word.passwords, rng_c)
+
     # Snapshot RNG C state here — this is the handoff point.
-    # The very next RNG consumer is WordGenerator.GetNextWord(passwords, rng_c)
-    # which produces routerPassword. Everything downstream chains from this state.
+    # If router_password was generated, the next consumer is CreaArmHardware.
+    # If not, the next consumer is WordGenerator.GetNextWord(passwords).
     handoff = RngStateSnapshot.from_rng(rng_c)
 
     notes = [
@@ -226,12 +210,25 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
         "Domain is verified against in-game observations.",
         "ESSID source list and suffix flag are derivable, but the actual "
         "wifi name string requires the Markov chain WordGenerator to be ported.",
-        "Router password, hardware specs, file system contents, LAN topology, "
-        "admin name, and admin password are all downstream of the WordGenerator "
-        "call and cannot be predicted without it. The handoff_rng_state field "
-        "captures Random C's state at the exact point where prediction stops.",
-        "routerPos and date are not seed-derivable (Guid.NewGuid + wall clock).",
     ]
+    if router_password is None:
+        notes.append(
+            "Router password not predicted — pass --wordlist-dir to enable. "
+            "Once enabled, password is the only post-LAN-subnet field we can derive."
+        )
+    else:
+        notes.append(
+            "Router password predicted via WordGenerator. UNVERIFIED — confirm "
+            "against in-game observation before trusting."
+        )
+    notes.extend([
+        "Hardware specs, file system contents, LAN topology, admin name, and "
+        "admin password are all downstream of opaque calls (CreaArmHardware, "
+        "FileSystem ctor, PreConstruyeLan, etc) and cannot be predicted "
+        "without porting those. The handoff_rng_state field captures Random "
+        "C's state at the exact point where prediction stops.",
+        "routerPos and date are not seed-derivable (Guid.NewGuid + wall clock).",
+    ])
 
     return RouterPrediction(
         world_seed=world_seed,
@@ -249,6 +246,7 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
         essid_first_draw=essid_first,
         router_id=router_id,
         lan_subnet_base=lan_subnet_base,
+        router_password=router_password,
         handoff_rng_state=handoff,
         notes=notes,
     )
@@ -266,10 +264,14 @@ def _format_pretty(pred: RouterPrediction) -> str:
                             + f"   (Next(7)={pred.essid_first_draw})",
         f"  router_id:      {pred.router_id}",
         f"  lan_subnet:     {pred.lan_subnet_base}",
-        "",
-        "  RNG handoff state captured — extend predictor when WordGenerator is ported.",
-        "",
     ]
+    if pred.router_password is not None:
+        lines.append(f"  router_password: {pred.router_password!r}  (UNVERIFIED)")
+    lines.extend([
+        "",
+        "  RNG handoff state captured — extend predictor when more decomps are ported.",
+        "",
+    ])
     return "\n".join(lines)
 
 
@@ -317,11 +319,40 @@ def parse_args() -> argparse.Namespace:
         help="Include the full 56-int RNG state snapshot in JSON output "
              "(default: omit, since it's large and only useful for extensions)",
     )
+    parser.add_argument(
+        "--wordlist-dir",
+        type=str,
+        default=None,
+        help="Path to directory containing Grey Hack wordlist files "
+             "(Surnamesmod, usernames, CorpNames, Passwords, lib_variables, "
+             "exploitNames). When supplied, router_password will be predicted.",
+    )
+    parser.add_argument(
+        "--wordlist-ext",
+        type=str,
+        default=".txt",
+        help="File extension for wordlists (default: .txt; pass empty string "
+             "if the game's resources have no extension)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.wordlist_dir:
+        if not _WORDGEN_AVAILABLE:
+            print(
+                "--wordlist-dir was supplied but wordgen.py is not importable. "
+                "Make sure wordgen.py is in the same directory as router_predict.py.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            wordgen.configure(args.wordlist_dir, ext=args.wordlist_ext)
+        except FileNotFoundError as e:
+            print(f"Failed to load wordlists: {e}", file=sys.stderr)
+            return 1
 
     if args.ip:
         ips = [args.ip]
