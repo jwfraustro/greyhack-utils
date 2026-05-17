@@ -17,12 +17,17 @@ import sys
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
+# WordGenerator is optional. If the user supplies --wordlist-dir, we'll
+# configure it and use it to predict the router password.
+# try:
+from python_tools import wordgen
+
 # Reuse all the validated primitives from the cracker.
 from python_tools.appleseed import (
     BASE_CONSONANTS,
     BASE_VOWELS,
-    TLDS,
     TIPO_RED,
+    TLDS,
     DotNetRandom,
     get_seed_from_ip_like_csharp,
     ip_to_uint_be,
@@ -32,15 +37,12 @@ from python_tools.appleseed import (
     to_uint32,
 )
 
-# WordGenerator is optional. If the user supplies --wordlist-dir, we'll
-# configure it and use it to predict the router password.
-# try:
-from python_tools import wordgen
 _WORDGEN_AVAILABLE = True
 # except ImportError:
 #     wordgen = None
 #     _WORDGEN_AVAILABLE = False
 
+wordgen.configure("./python_tools/wordlists/", ext=".txt")
 
 # Match ServerMap.TipoRed enum ordering. Note the enum starts with Unknown=0,
 # while IpGenerator.tiposRed is 0-indexed FROM Comisaria. The site-type
@@ -59,6 +61,7 @@ ESSID_SOURCE_CORPNAMES = "corp_names"
 @dataclass
 class RngStateSnapshot:
     """Serializable snapshot of a DotNetRandom state, for handoff to extensions."""
+
     seed_array: List[int]
     inext: int
     inextp: int
@@ -86,17 +89,17 @@ class RouterPrediction:
     tipo_red_index: int
     web_address: str
     domain: str
-    domain_name: str           # the bit between "www." and ".<tld>"
+    domain_name: str  # the bit between "www." and ".<tld>"
     tld: str
     bssid: str
-    essid_source: str          # "corp_names" or "usernames" (latter is dead code)
-    essid_has_suffix: bool     # if num < 3, "_SUFFIX" is appended via OS.GetRandomName
-    essid_first_draw: int      # the raw Next(7) value
+    essid_source: str  # "corp_names" or "usernames" (latter is dead code)
+    essid_has_suffix: bool  # if num < 3, "_SUFFIX" is appended via OS.GetRandomName
+    essid_first_draw: int  # the raw Next(7) value
 
     # GeneraRouter (Random B, fresh)
     router_id: str
 
-    lan_subnet_base: str       # the "192.168.x.1" value the router will use
+    lan_subnet_base: str  # the "192.168.x.1" value the router will use
 
     # Optional: full essid string. Only derivable when wordlists are available
     # (the corp_names Markov chain plus, for num < 3, OS.GetRandomName's draws).
@@ -270,14 +273,16 @@ def predict_router(world_seed: int, ip_address: str) -> RouterPrediction:
             "Router password predicted via WordGenerator. UNVERIFIED — confirm "
             "against in-game observation before trusting."
         )
-    notes.extend([
-        "Hardware specs, file system contents, LAN topology, admin name, and "
-        "admin password are all downstream of opaque calls (CreaArmHardware, "
-        "FileSystem ctor, PreConstruyeLan, etc) and cannot be predicted "
-        "without porting those. The handoff_rng_state field captures Random "
-        "C's state at the exact point where prediction stops.",
-        "routerPos and date are not seed-derivable (Guid.NewGuid + wall clock).",
-    ])
+    notes.extend(
+        [
+            "Hardware specs, file system contents, LAN topology, admin name, and "
+            "admin password are all downstream of opaque calls (CreaArmHardware, "
+            "FileSystem ctor, PreConstruyeLan, etc) and cannot be predicted "
+            "without porting those. The handoff_rng_state field captures Random "
+            "C's state at the exact point where prediction stops.",
+            "routerPos and date are not seed-derivable (Guid.NewGuid + wall clock).",
+        ]
+    )
 
     return RouterPrediction(
         world_seed=world_seed,
@@ -318,17 +323,21 @@ def _format_pretty(pred: RouterPrediction) -> str:
             + (" + _<SUFFIX>" if pred.essid_has_suffix else "")
             + f"   (Next(7)={pred.essid_first_draw})"
         )
-    lines.extend([
-        f"  router_id:      {pred.router_id}",
-        f"  lan_subnet:     {pred.lan_subnet_base}",
-    ])
+    lines.extend(
+        [
+            f"  router_id:      {pred.router_id}",
+            f"  lan_subnet:     {pred.lan_subnet_base}",
+        ]
+    )
     if pred.router_password is not None:
         lines.append(f"  router_password: {pred.router_password!r}  (UNVERIFIED)")
-    lines.extend([
-        "",
-        "  RNG handoff state captured — extend predictor when more decomps are ported.",
-        "",
-    ])
+    lines.extend(
+        [
+            "",
+            "  RNG handoff state captured — extend predictor when more decomps are ported.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -374,22 +383,22 @@ def parse_args() -> argparse.Namespace:
         "--include-rng-state",
         action="store_true",
         help="Include the full 56-int RNG state snapshot in JSON output "
-             "(default: omit, since it's large and only useful for extensions)",
+        "(default: omit, since it's large and only useful for extensions)",
     )
     parser.add_argument(
         "--wordlist-dir",
         type=str,
         default=None,
         help="Path to directory containing Grey Hack wordlist files "
-             "(Surnamesmod, usernames, CorpNames, Passwords, lib_variables, "
-             "exploitNames). When supplied, router_password will be predicted.",
+        "(Surnamesmod, usernames, CorpNames, Passwords, lib_variables, "
+        "exploitNames). When supplied, router_password will be predicted.",
     )
     parser.add_argument(
         "--wordlist-ext",
         type=str,
         default=".txt",
         help="File extension for wordlists (default: .txt; pass empty string "
-             "if the game's resources have no extension)",
+        "if the game's resources have no extension)",
     )
     return parser.parse_args()
 
